@@ -154,7 +154,7 @@ test("generates and exports a bitmap sheet from an uploaded font", async ({ page
     cellWidth: 32,
     cellHeight: 32,
     columns: 16,
-    format: "swift-proportional-grid-v1",
+    format: "proportional-grid-v1",
     metrics: {
       originX: 0,
       baselineY: 28,
@@ -285,7 +285,7 @@ test("preserves OpenType left side bearing when the glyph outline starts at x ze
     cellWidth: 20,
     cellHeight: 28,
     columns: 16,
-    format: "swift-proportional-grid-v1",
+    format: "proportional-grid-v1",
     glyphs: [
       {
         char: "i",

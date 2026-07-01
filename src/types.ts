@@ -33,7 +33,7 @@ export interface BasicBitmapMetadata {
 }
 
 export interface ExtendedBitmapMetadata extends BasicBitmapMetadata {
-  format: "swift-proportional-grid-v1";
+  format: "proportional-grid-v1";
   metrics: {
     originX: number;
     baselineY: number;

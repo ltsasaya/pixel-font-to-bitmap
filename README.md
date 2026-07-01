@@ -63,7 +63,7 @@ The ZIP contains:
 - `metadata.json`
 - the atlas PNG named by the Atlas filename field
 
-The Atlas filename field starts blank, then fills from the uploaded font filename. Edit it before export if the PNG or Xcode asset name should differ.
+The Atlas filename field starts blank, then fills from the uploaded font filename. Edit it before export if the PNG name should differ.
 
 `metadata.json` uses a standard fixed-grid bitmap mapping:
 
@@ -77,19 +77,19 @@ The Atlas filename field starts blank, then fills from the uploaded font filenam
 }
 ```
 
-Any renderer can calculate a character cell with:
+Any renderer can calculate a character cell with this fixed-grid formula:
 
-```swift
-let index = characters.firstIndex(of: character)
-let column = index % columns
-let row = index / columns
-let x = column * cellWidth
-let y = row * cellHeight
+```text
+index = position of character in characters
+column = index % columns
+row = index / columns
+x = column * cellWidth
+y = row * cellHeight
 ```
 
 ## Export Extended ZIP
 
-The Extended export writes the same atlas PNG but includes extra metadata for Swift/game use and debugging:
+The Extended export writes the same atlas PNG but includes extra metadata for proportional rendering and debugging:
 
 ```json
 {
@@ -98,7 +98,7 @@ The Extended export writes the same atlas PNG but includes extra metadata for Sw
   "cellWidth": 8,
   "cellHeight": 8,
   "columns": 16,
-  "format": "swift-proportional-grid-v1",
+  "format": "proportional-grid-v1",
   "metrics": {
     "originX": 0,
     "baselineY": 7,
@@ -129,9 +129,9 @@ The Extended export writes the same atlas PNG but includes extra metadata for Sw
 }
 ```
 
-Swift should draw each extended glyph from its atlas rectangle at `cursorX + xOffset`
-and `baselineY + yOffset`, then advance by `xAdvance`. Empty glyphs such as spaces
-draw nothing but still advance the cursor.
+For proportional rendering, draw each extended glyph from its atlas rectangle at
+`cursorX + xOffset` and `baselineY + yOffset`, then advance by `xAdvance`.
+Empty glyphs such as spaces draw nothing but still advance the cursor.
 
 Basic export is intentionally simple and may render text as monospaced if the renderer uses only cell positions. Use Extended export when letters such as `i`, punctuation, or spaces need to preserve the font's natural side bearings and advance widths.
 
@@ -141,11 +141,11 @@ Basic export is intentionally simple and may render text as monospaced if the re
 - Type a custom order when you want a smaller game-specific alphabet.
 - Enable Filter to keep only characters in the editable keep set. Presets such as printable ASCII, letters/digits, uppercase, lowercase, digits, and common game text add characters into that set.
 - Missing custom-requested characters are shown before export.
-- Duplicate characters are blocked because Swift lookup would be ambiguous.
+- Duplicate characters are blocked because character lookup would be ambiguous.
 - Extended export includes per-character proportional metrics for renderers that should not be monospaced.
 - Transparent atlas pixels are validated so alpha is only `0` or `255`.
 - Export text color controls PNG glyph RGB values; the preview remains black for readability.
-- Unmapped internal glyphs cannot be auto-detected for Swift because they do not have characters Swift can look up.
+- Unmapped internal glyphs cannot be auto-detected because they do not have Unicode characters to look up.
 
 ## Git Notes
 

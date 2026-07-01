@@ -287,7 +287,7 @@ export async function convertFontToBitmap(
   const layout = layouts[0];
 
   if (!layout || layouts.length > 1) {
-    throw new Error("The fixed-grid Swift export must fit in a single atlas. Reduce characters, columns, or cell size.");
+    throw new Error("The fixed-grid export must fit in a single atlas. Reduce characters, columns, or cell size.");
   }
 
   const exportTextColor = hexColorToRgba(settings.exportTextColor);
@@ -389,7 +389,7 @@ export async function convertFontToBitmap(
       cellWidth: settings.cellWidth,
       cellHeight: settings.cellHeight,
       columns: settings.columns,
-      format: "swift-proportional-grid-v1",
+      format: "proportional-grid-v1",
       metrics: {
         originX: roundMetric(cellOriginX(settings, fitPlan)),
         baselineY: roundMetric(cellBaselineY(settings, fitPlan)),
