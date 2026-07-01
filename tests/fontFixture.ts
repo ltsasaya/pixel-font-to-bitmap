@@ -5,17 +5,20 @@ export function createFixtureFontArrayBuffer(): ArrayBuffer {
   const notdef = new opentype.Glyph({
     name: ".notdef",
     advanceWidth: 500,
+    leftSideBearing: 60,
     path: rectanglePath(60, 0, 380, 600)
   });
   const letterA = new opentype.Glyph({
     name: "A",
     unicode: 65,
     advanceWidth: 600,
+    leftSideBearing: 50,
     path: rectanglePath(50, 0, 550, 700)
   });
   const internalBox = new opentype.Glyph({
     name: "internal.box",
     advanceWidth: 600,
+    leftSideBearing: 100,
     path: rectanglePath(100, 100, 500, 500)
   });
   const space = new opentype.Glyph({
@@ -32,6 +35,32 @@ export function createFixtureFontArrayBuffer(): ArrayBuffer {
     ascender: 800,
     descender: -200,
     glyphs: [notdef, letterA, internalBox, space]
+  });
+
+  return font.toArrayBuffer();
+}
+
+export function createSideBearingFixtureFontArrayBuffer(): ArrayBuffer {
+  const notdef = new opentype.Glyph({
+    name: ".notdef",
+    advanceWidth: 500,
+    path: rectanglePath(60, 0, 380, 600)
+  });
+  const letterI = new opentype.Glyph({
+    name: "i",
+    unicode: 105,
+    advanceWidth: 500,
+    leftSideBearing: 200,
+    path: rectanglePath(0, 0, 100, 700)
+  });
+
+  const font = new opentype.Font({
+    familyName: "Side Bearing Fixture",
+    styleName: "Regular",
+    unitsPerEm: 1000,
+    ascender: 800,
+    descender: -200,
+    glyphs: [notdef, letterI]
   });
 
   return font.toArrayBuffer();

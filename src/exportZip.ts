@@ -1,9 +1,15 @@
 import { strToU8, zipSync } from "fflate";
 import type { BitmapConversionResult } from "./types";
 
-export async function createBitmapZip(result: BitmapConversionResult): Promise<Blob> {
+export type BitmapZipMode = "basic" | "extended";
+
+export async function createBitmapZip(
+  result: BitmapConversionResult,
+  mode: BitmapZipMode = "basic"
+): Promise<Blob> {
+  const metadata = mode === "extended" ? result.extendedMetadata : result.metadata;
   const files: Record<string, Uint8Array> = {
-    "metadata.json": strToU8(`${JSON.stringify(result.metadata, null, 2)}\n`)
+    "metadata.json": strToU8(`${JSON.stringify(metadata, null, 2)}\n`)
   };
 
   for (const sheet of result.sheets) {
@@ -39,4 +45,3 @@ async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> 
 
   return new Uint8Array(await blob.arrayBuffer());
 }
-

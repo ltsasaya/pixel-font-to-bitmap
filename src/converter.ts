@@ -1,23 +1,32 @@
 import type { BoundingBox, Font, Glyph } from "opentype.js";
 import { alphaToBinaryRgba, createSheetLayouts, getCellPlacement } from "./bitmap";
+import type { AlphaBitmap } from "./bitmap";
 import { opentype } from "./opentypeCompat";
 import type {
   BitmapConversionResult,
   BitmapConverterSettings,
-  BitmapExport,
-  BitmapGlyphExport,
+  CellPlacement,
+  CharacterFilterMode,
+  CharacterFilterPreset,
   DesignBounds,
   GlyphSourceRecord,
-  RasterReport
+  MinimumCellSizeResult,
+  ProportionalGlyphMetadata,
+  RasterReport,
+  RgbaTuple
 } from "./types";
 
 export const DEFAULT_SETTINGS: BitmapConverterSettings = {
   cellWidth: 32,
   cellHeight: 32,
-  padding: 1,
+  padding: 0,
   threshold: 128,
   columns: 16,
-  background: "solid",
+  atlasFileName: "",
+  characters: "",
+  characterFilterMode: "none",
+  characterFilterSet: "",
+  exportTextColor: "#ffffff",
   maxSheetDimension: 4096
 };
 
@@ -39,7 +48,11 @@ export function normalizeSettings(
     padding: clampInteger(next.padding, 0, maxPadding, "padding"),
     threshold: clampInteger(next.threshold, 0, 255, "threshold"),
     columns: clampInteger(next.columns, 1, 128, "columns"),
-    background: next.background === "solid" ? "solid" : "transparent",
+    atlasFileName: normalizeAtlasFileName(next.atlasFileName),
+    characters: normalizeCharacterOrder(next.characters),
+    characterFilterMode: normalizeCharacterFilterMode(next.characterFilterMode),
+    characterFilterSet: normalizeCharacterOrder(next.characterFilterSet),
+    exportTextColor: normalizeHexColor(next.exportTextColor),
     maxSheetDimension: clampInteger(next.maxSheetDimension, 256, 16_384, "maxSheetDimension")
   };
 }
@@ -59,55 +72,246 @@ export function collectGlyphRecords(font: Font): GlyphSourceRecord[] {
 
   for (let index = 0; index < glyphCount; index += 1) {
     const glyph = font.glyphs.get(index);
-    const designBounds = toDesignBounds(glyph.getBoundingBox());
-    const name = glyph.name ?? font.glyphIndexToName?.(index) ?? undefined;
-
-    records.push({
-      glyphIndex: index,
-      name: name || undefined,
-      unicodes: collectUnicodes(glyph),
-      designBounds,
-      empty: isEmptyDesignBounds(designBounds)
-    });
+    records.push(glyphToRecord(glyph, font.glyphIndexToName?.(index) ?? undefined));
   }
 
   return records;
 }
 
+function glyphToRecord(glyph: Glyph, fallbackName?: string): GlyphSourceRecord {
+  const designBounds = toDesignBounds(glyph.getBoundingBox());
+  const name = glyph.name ?? fallbackName ?? undefined;
+
+  return {
+    glyphIndex: glyph.index,
+    name: name || undefined,
+    unicodes: collectUnicodes(glyph),
+    designBounds,
+    advanceWidth: finiteOrZero(glyph.advanceWidth ?? 0),
+    leftSideBearing: finiteOrFallback(glyph.leftSideBearing, designBounds.x1),
+    empty: isEmptyDesignBounds(designBounds)
+  };
+}
+
+function emptyCharacterRecord(character: string): GlyphSourceRecord {
+  return {
+    glyphIndex: -1,
+    name: `missing-${character.codePointAt(0)?.toString(16) ?? "unknown"}`,
+    unicodes: [],
+    designBounds: { x1: 0, y1: 0, x2: 0, y2: 0 },
+    advanceWidth: 0,
+    leftSideBearing: 0,
+    empty: true
+  };
+}
+
+export interface CharacterPlanEntry {
+  character: string;
+  glyph?: Glyph;
+  record: GlyphSourceRecord;
+  missing: boolean;
+}
+
+export interface CharacterPlan {
+  entries: CharacterPlanEntry[];
+  missingCharacters: string[];
+  duplicateCharacters: string[];
+}
+
+export function createCharacterPlan(font: Font, characters: string): CharacterPlan {
+  const entries: CharacterPlanEntry[] = [];
+  const missing = new Set<string>();
+  const duplicates = new Set<string>();
+  const seen = new Set<string>();
+
+  for (const character of Array.from(characters)) {
+    if (seen.has(character)) {
+      duplicates.add(character);
+    }
+    seen.add(character);
+
+    const hasCharacter = font.hasChar(character);
+    const glyph = hasCharacter ? font.charToGlyph(character) : undefined;
+
+    if (!glyph) {
+      missing.add(character);
+      entries.push({
+        character,
+        record: emptyCharacterRecord(character),
+        missing: true
+      });
+      continue;
+    }
+
+    entries.push({
+      character,
+      glyph,
+      record: glyphToRecord(glyph),
+      missing: false
+    });
+  }
+
+  return {
+    entries,
+    missingCharacters: [...missing],
+    duplicateCharacters: [...duplicates]
+  };
+}
+
+export function detectFontCharacterOrder(font: Font): string {
+  const codepoints = new Set<number>();
+
+  for (const record of collectGlyphRecords(font)) {
+    for (const unicode of record.unicodes) {
+      if (isExportableCodepoint(unicode)) {
+        codepoints.add(unicode);
+      }
+    }
+  }
+
+  return [...codepoints]
+    .sort((left, right) => left - right)
+    .map((unicode) => String.fromCodePoint(unicode))
+    .join("");
+}
+
+export function detectFontCharacterOrderFromBuffer(buffer: ArrayBuffer): string {
+  return detectFontCharacterOrder(parseOpenTypeFont(buffer));
+}
+
+export function applyCharacterFilter(
+  characters: string,
+  settings: Pick<BitmapConverterSettings, "characterFilterMode" | "characterFilterSet">
+): string {
+  if (settings.characterFilterMode === "none") {
+    return characters;
+  }
+
+  const keepSet = makeCharacterSet(settings.characterFilterSet);
+
+  return Array.from(characters)
+    .filter((character) => keepSet.has(character))
+    .join("");
+}
+
+export function characterFilterPresetCharacters(preset: CharacterFilterPreset): string {
+  switch (preset) {
+    case "ascii-printable":
+      return printableAsciiCharacters();
+    case "ascii-alphanumeric":
+      return `${uppercaseAsciiCharacters()}${lowercaseAsciiCharacters()}${digitCharacters()}`;
+    case "uppercase":
+      return uppercaseAsciiCharacters();
+    case "lowercase":
+      return lowercaseAsciiCharacters();
+    case "digits":
+      return digitCharacters();
+    case "common-game":
+      return ` ${uppercaseAsciiCharacters()}${digitCharacters()}!?.,:;'"-_+/=()[]#%&@`;
+  }
+}
+
+interface CharacterResolution {
+  characters: string;
+  source: "auto" | "manual";
+}
+
+function resolveCharacters(font: Font, settings: BitmapConverterSettings): CharacterResolution {
+  const baseCharacters = settings.characters || detectFontCharacterOrder(font);
+  const source = settings.characters ? "manual" : "auto";
+
+  if (baseCharacters.length === 0) {
+    throw new Error("No Unicode-mapped characters were found in this font.");
+  }
+
+  const characters = applyCharacterFilter(baseCharacters, settings);
+
+  if (characters.length === 0) {
+    throw new Error("No characters remain after applying the selected character filter.");
+  }
+
+  return {
+    characters,
+    source
+  };
+}
+
+export function detectMinimumCellSizeFromBuffer(
+  buffer: ArrayBuffer,
+  settingsInput: Partial<BitmapConverterSettings> = {}
+): MinimumCellSizeResult {
+  const settings = normalizeSettings(settingsInput);
+  const font = parseOpenTypeFont(buffer);
+  const characterResolution = resolveCharacters(font, settings);
+
+  const characterPlan = createCharacterPlan(font, characterResolution.characters);
+  const presentRecords = characterPlan.entries
+    .filter((entry) => !entry.missing)
+    .map((entry) => entry.record);
+
+  if (presentRecords.length === 0) {
+    throw new Error("No drawable requested characters were found in this font.");
+  }
+
+  const minimum = computeMinimumCellSize(font, presentRecords, settings.padding);
+
+  return {
+    ...minimum,
+    characterCount: characterPlan.entries.length,
+    characterSource: characterResolution.source
+  };
+}
+
 export async function convertFontToBitmap(
   input: ArrayBuffer,
-  fileName: string,
+  _fileName: string,
   settingsInput: Partial<BitmapConverterSettings> = {}
 ): Promise<BitmapConversionResult> {
   const settings = normalizeSettings(settingsInput);
   const font = parseOpenTypeFont(input);
-  const glyphRecords = collectGlyphRecords(font);
-  const fitPlan = computePixelFitPlan(font, glyphRecords, settings);
+  const characterResolution = resolveCharacters(font, settings);
+  const characters = characterResolution.characters;
+
+  const characterPlan = createCharacterPlan(font, characters);
+  const presentRecords = characterPlan.entries
+    .filter((entry) => !entry.missing)
+    .map((entry) => entry.record);
+  const fitPlan = computePixelFitPlan(font, presentRecords, settings);
   const layouts = createSheetLayouts(
-    glyphRecords.length,
+    characterPlan.entries.length,
     settings.cellWidth,
     settings.cellHeight,
     settings.columns,
     settings.maxSheetDimension
   );
-  const sheetCanvases = layouts.map((layout) =>
-    createSheetCanvas(layout.width, layout.height, settings.background)
-  );
-  const glyphs: BitmapGlyphExport[] = [];
+  const layout = layouts[0];
+
+  if (!layout || layouts.length > 1) {
+    throw new Error("The fixed-grid Swift export must fit in a single atlas. Reduce characters, columns, or cell size.");
+  }
+
+  const exportTextColor = hexColorToRgba(settings.exportTextColor);
+  const previewTextColor: RgbaTuple = [0, 0, 0, 255];
+  const exportSheetCanvases = [createSheetCanvas(layout.width, layout.height)];
+  const previewSheetCanvases = [createSheetCanvas(layout.width, layout.height)];
   let rawGrayPixels = 0;
   let rawPixelCount = 0;
   let outputInvalidPixels = 0;
+  const proportionalGlyphs: ProportionalGlyphMetadata[] = [];
 
-  for (let ordinal = 0; ordinal < glyphRecords.length; ordinal += 1) {
-    const record = glyphRecords[ordinal];
-    const glyph = font.glyphs.get(record.glyphIndex);
+  for (let ordinal = 0; ordinal < characterPlan.entries.length; ordinal += 1) {
+    const entry = characterPlan.entries[ordinal];
+    const record = entry.record;
+    const glyph = entry.glyph;
     const placement = getCellPlacement(
       ordinal,
       layouts,
       settings.cellWidth,
       settings.cellHeight
     );
-    const cellCanvas = renderGlyphCell(glyph, record, settings, fitPlan);
+    const cellCanvas = glyph
+      ? renderGlyphCell(glyph, record, settings, fitPlan)
+      : createCanvas(settings.cellWidth, settings.cellHeight);
     const cellContext = get2dContext(cellCanvas);
     const sourceImage = cellContext.getImageData(0, 0, settings.cellWidth, settings.cellHeight);
     const binaryCell = alphaToBinaryRgba(
@@ -115,31 +319,40 @@ export async function convertFontToBitmap(
       settings.cellWidth,
       settings.cellHeight,
       settings.threshold,
-      settings.background
+      "transparent",
+      exportTextColor
     );
-    const sheetContext = get2dContext(sheetCanvases[placement.sheet]);
-    const binaryImage = sheetContext.createImageData(settings.cellWidth, settings.cellHeight);
+    const previewCell = alphaToBinaryRgba(
+      sourceImage.data,
+      settings.cellWidth,
+      settings.cellHeight,
+      settings.threshold,
+      "transparent",
+      previewTextColor
+    );
+    proportionalGlyphs.push(
+      createProportionalGlyphMetadata(
+        entry.character,
+        ordinal,
+        record,
+        placement,
+        binaryCell.bitmap,
+        settings,
+        fitPlan
+      )
+    );
+    const exportSheetContext = get2dContext(exportSheetCanvases[placement.sheet]);
+    const previewSheetContext = get2dContext(previewSheetCanvases[placement.sheet]);
+    const binaryImage = exportSheetContext.createImageData(settings.cellWidth, settings.cellHeight);
+    const previewImage = previewSheetContext.createImageData(settings.cellWidth, settings.cellHeight);
 
     binaryImage.data.set(binaryCell.rgba);
-    sheetContext.putImageData(binaryImage, placement.x, placement.y);
+    previewImage.data.set(previewCell.rgba);
+    exportSheetContext.putImageData(binaryImage, placement.x, placement.y);
+    previewSheetContext.putImageData(previewImage, placement.x, placement.y);
     rawGrayPixels += binaryCell.sourceGrayPixels;
     rawPixelCount += settings.cellWidth * settings.cellHeight;
     outputInvalidPixels += binaryCell.outputInvalidPixels;
-
-    glyphs.push({
-      id: `gid-${record.glyphIndex}`,
-      glyphIndex: record.glyphIndex,
-      name: record.name,
-      unicodes: record.unicodes,
-      sheet: placement.sheet,
-      x: placement.x,
-      y: placement.y,
-      width: placement.width,
-      height: placement.height,
-      bounds: binaryCell.bitmap.bounds,
-      empty: binaryCell.bitmap.empty,
-      pixels: binaryCell.bitmap.pixels
-    });
   }
 
   const raster: RasterReport = {
@@ -153,46 +366,111 @@ export async function convertFontToBitmap(
       sourceGridUnit: fitPlan.sourceGridUnit,
       sourceMaxGlyphWidthPixels: fitPlan.sourceMaxGlyphWidthPixels,
       sourceMaxGlyphHeightPixels: fitPlan.sourceMaxGlyphHeightPixels,
+      sourceAscentPixels: fitPlan.sourceAscentPixels,
+      sourceDescentPixels: fitPlan.sourceDescentPixels,
+      baselineOffsetPixels: fitPlan.baselineOffsetPixels,
       outputPixelsPerSourcePixel: fitPlan.outputPixelsPerSourcePixel,
       fontSize: fitPlan.fontSize,
       scale: fitPlan.scale
     }
   };
 
-  const metadata: BitmapExport = {
-    version: 1,
-    font: {
-      fileName,
-      familyName: getFontFamilyName(font),
-      glyphCount: glyphRecords.length,
-      unitsPerEm: font.unitsPerEm
-    },
-    settings: {
+  return {
+    metadata: {
+      atlas: settings.atlasFileName,
+      characters,
       cellWidth: settings.cellWidth,
       cellHeight: settings.cellHeight,
-      padding: settings.padding,
-      threshold: settings.threshold,
-      mode: "one-bit-alpha-threshold",
-      background: settings.background
+      columns: settings.columns
     },
-    raster,
-    sheets: layouts.map((layout) => ({
-      fileName: sheetFileName(fileName, layout.sheetIndex),
-      width: layout.width,
-      height: layout.height,
-      columns: layout.columns,
-      rows: layout.rows
+    extendedMetadata: {
+      atlas: settings.atlasFileName,
+      characters,
+      cellWidth: settings.cellWidth,
+      cellHeight: settings.cellHeight,
+      columns: settings.columns,
+      format: "swift-proportional-grid-v1",
+      metrics: {
+        originX: roundMetric(cellOriginX(settings, fitPlan)),
+        baselineY: roundMetric(cellBaselineY(settings, fitPlan)),
+        lineAdvance: settings.cellHeight
+      },
+      glyphs: proportionalGlyphs,
+      characterSource: characterResolution.source,
+      characterFilter: {
+        mode: settings.characterFilterMode,
+        set: settings.characterFilterMode === "keep-set" ? settings.characterFilterSet : undefined
+      },
+      glyphPixel: exportTextColor,
+      emptyPixel: [0, 0, 0, 0],
+      binaryAlpha: true,
+      diagnostics: raster
+    },
+    diagnostics: raster,
+    sheets: exportSheetCanvases.map((canvas, index) => ({
+      fileName: settings.atlasFileName,
+      canvas,
+      previewCanvas: previewSheetCanvases[index]
     })),
-    glyphs
+    characterCount: characterPlan.entries.length,
+    characterSource: characterResolution.source,
+    missingCharacters: characterPlan.missingCharacters,
+    duplicateCharacters: characterPlan.duplicateCharacters
   };
+}
+
+function createProportionalGlyphMetadata(
+  character: string,
+  index: number,
+  record: GlyphSourceRecord,
+  placement: CellPlacement,
+  bitmap: AlphaBitmap,
+  settings: BitmapConverterSettings,
+  fitPlan: PixelFitPlan
+): ProportionalGlyphMetadata {
+  const xAdvance = roundMetric(record.advanceWidth * fitPlan.scale);
+
+  if (bitmap.empty) {
+    return {
+      char: character,
+      codePoint: character.codePointAt(0) ?? 0,
+      glyphIndex: record.glyphIndex,
+      index,
+      x: placement.x,
+      y: placement.y,
+      width: 0,
+      height: 0,
+      bounds: { x: 0, y: 0, width: 0, height: 0 },
+      xOffset: 0,
+      yOffset: 0,
+      xAdvance,
+      empty: true
+    };
+  }
 
   return {
-    metadata,
-    sheets: sheetCanvases.map((canvas, index) => ({
-      fileName: metadata.sheets[index].fileName,
-      canvas
-    }))
+    char: character,
+    codePoint: character.codePointAt(0) ?? 0,
+    glyphIndex: record.glyphIndex,
+    index,
+    x: placement.x + bitmap.bounds.x,
+    y: placement.y + bitmap.bounds.y,
+    width: bitmap.bounds.width,
+    height: bitmap.bounds.height,
+    bounds: bitmap.bounds,
+    xOffset: roundMetric(bitmap.bounds.x - cellOriginX(settings, fitPlan)),
+    yOffset: roundMetric(bitmap.bounds.y - cellBaselineY(settings, fitPlan)),
+    xAdvance,
+    empty: false
   };
+}
+
+function cellOriginX(settings: BitmapConverterSettings, fitPlan: PixelFitPlan): number {
+  return settings.padding + fitPlan.horizontalOriginOffsetPixels;
+}
+
+function cellBaselineY(settings: BitmapConverterSettings, fitPlan: PixelFitPlan): number {
+  return settings.padding + fitPlan.baselineOffsetPixels;
 }
 
 export interface PixelFitPlan {
@@ -202,6 +480,10 @@ export interface PixelFitPlan {
   sourceGridUnit: number;
   sourceMaxGlyphWidthPixels: number;
   sourceMaxGlyphHeightPixels: number;
+  sourceAscentPixels: number;
+  sourceDescentPixels: number;
+  baselineOffsetPixels: number;
+  horizontalOriginOffsetPixels: number;
   outputPixelsPerSourcePixel: number;
 }
 
@@ -213,16 +495,25 @@ export function computePixelFitPlan(
   const visibleBounds = glyphRecords
     .filter((record) => !record.empty)
     .map((record) => record.designBounds);
-  const maxWidth = Math.max(0, ...visibleBounds.map((bounds) => bounds.x2 - bounds.x1));
-  const maxHeight = Math.max(0, ...visibleBounds.map((bounds) => bounds.y2 - bounds.y1));
+  const horizontalFrame = computeHorizontalFrame(glyphRecords);
+  const frame = computeBaselineFrame(visibleBounds);
   const availableWidth = Math.max(1, settings.cellWidth - settings.padding * 2);
   const availableHeight = Math.max(1, settings.cellHeight - settings.padding * 2);
   const unitsPerEm = font.unitsPerEm || 1000;
   const inferredGridUnit = inferDesignGridUnit(font, glyphRecords);
 
-  if (inferredGridUnit && maxWidth > 0 && maxHeight > 0) {
-    const sourceMaxGlyphWidthPixels = Math.max(1, Math.ceil(maxWidth / inferredGridUnit));
-    const sourceMaxGlyphHeightPixels = Math.max(1, Math.ceil(maxHeight / inferredGridUnit));
+  if (inferredGridUnit && horizontalFrame.width > 0 && frame.height > 0) {
+    const snappedMinX = snapDown(horizontalFrame.minX, inferredGridUnit);
+    const snappedMaxX = snapUp(horizontalFrame.maxX, inferredGridUnit);
+    const sourceMaxGlyphWidthPixels = Math.max(
+      1,
+      Math.ceil((snappedMaxX - snappedMinX) / inferredGridUnit)
+    );
+    const snappedAscent = snapUp(frame.ascent, inferredGridUnit);
+    const snappedDescent = snapUp(frame.descent, inferredGridUnit);
+    const sourceAscentPixels = Math.max(0, Math.ceil(snappedAscent / inferredGridUnit));
+    const sourceDescentPixels = Math.max(0, Math.ceil(snappedDescent / inferredGridUnit));
+    const sourceMaxGlyphHeightPixels = Math.max(1, sourceAscentPixels + sourceDescentPixels);
     const outputPixelsPerSourcePixel = Math.max(
       1,
       Math.floor(
@@ -239,6 +530,11 @@ export function computePixelFitPlan(
       sourceGridUnit: inferredGridUnit,
       sourceMaxGlyphWidthPixels,
       sourceMaxGlyphHeightPixels,
+      sourceAscentPixels,
+      sourceDescentPixels,
+      baselineOffsetPixels: sourceAscentPixels * outputPixelsPerSourcePixel,
+      horizontalOriginOffsetPixels:
+        (-snappedMinX / inferredGridUnit) * outputPixelsPerSourcePixel,
       outputPixelsPerSourcePixel,
       scale,
       fontSize: scale * unitsPerEm
@@ -250,11 +546,49 @@ export function computePixelFitPlan(
   return {
     strategy: "bounds-fit",
     sourceGridUnit: fallback.scale === 0 ? 1 : 1 / fallback.scale,
-    sourceMaxGlyphWidthPixels: Math.ceil(maxWidth * fallback.scale),
-    sourceMaxGlyphHeightPixels: Math.ceil(maxHeight * fallback.scale),
+    sourceMaxGlyphWidthPixels: Math.ceil(horizontalFrame.width * fallback.scale),
+    sourceMaxGlyphHeightPixels: Math.ceil(frame.height * fallback.scale),
+    sourceAscentPixels: frame.ascent * fallback.scale,
+    sourceDescentPixels: frame.descent * fallback.scale,
+    baselineOffsetPixels: frame.ascent * fallback.scale,
+    horizontalOriginOffsetPixels: -horizontalFrame.minX * fallback.scale,
     outputPixelsPerSourcePixel: 1,
     fontSize: fallback.fontSize,
     scale: fallback.scale
+  };
+}
+
+export function computeMinimumCellSize(
+  font: Font,
+  glyphRecords: GlyphSourceRecord[],
+  padding: number
+): Omit<MinimumCellSizeResult, "characterCount" | "characterSource"> {
+  const visibleBounds = glyphRecords
+    .filter((record) => !record.empty)
+    .map((record) => record.designBounds);
+  const horizontalFrame = computeHorizontalFrame(glyphRecords);
+  const frame = computeBaselineFrame(visibleBounds);
+  const gridUnit = inferDesignGridUnit(font, glyphRecords) ?? 1;
+  const sourceMaxGlyphWidthPixels = Math.max(
+    1,
+    Math.ceil(
+      (snapUp(horizontalFrame.maxX, gridUnit) - snapDown(horizontalFrame.minX, gridUnit)) /
+        gridUnit
+    )
+  );
+  const sourceMaxGlyphHeightPixels = Math.max(
+    1,
+    Math.ceil(snapUp(frame.ascent, gridUnit) / gridUnit) +
+      Math.ceil(snapUp(frame.descent, gridUnit) / gridUnit)
+  );
+  const normalizedPadding = Math.max(0, Math.round(padding));
+
+  return {
+    cellWidth: Math.min(512, sourceMaxGlyphWidthPixels + normalizedPadding * 2),
+    cellHeight: Math.min(512, sourceMaxGlyphHeightPixels + normalizedPadding * 2),
+    sourceMaxGlyphWidthPixels,
+    sourceMaxGlyphHeightPixels,
+    sourceGridUnit: gridUnit
   };
 }
 
@@ -267,6 +601,10 @@ export function inferDesignGridUnit(
   const unitsPerEm = font.unitsPerEm || 1000;
 
   for (const record of glyphRecords) {
+    if (record.advanceWidth > 0) {
+      scaledDeltas.push(Math.round(record.advanceWidth * scaleFactor));
+    }
+
     if (record.empty) {
       continue;
     }
@@ -293,6 +631,45 @@ export function inferDesignGridUnit(
   return dominant ? dominant / scaleFactor : undefined;
 }
 
+function computeBaselineFrame(boundsList: DesignBounds[]): {
+  ascent: number;
+  descent: number;
+  height: number;
+} {
+  const maxY = Math.max(0, ...boundsList.map((bounds) => bounds.y2));
+  const minY = Math.min(0, ...boundsList.map((bounds) => bounds.y1));
+  const ascent = Math.max(0, maxY);
+  const descent = Math.max(0, -minY);
+
+  return {
+    ascent,
+    descent,
+    height: ascent + descent
+  };
+}
+
+function computeHorizontalFrame(glyphRecords: GlyphSourceRecord[]): {
+  minX: number;
+  maxX: number;
+  width: number;
+} {
+  const visibleRecords = glyphRecords.filter((record) => !record.empty);
+  const minX = Math.min(0, ...visibleRecords.map((record) => record.leftSideBearing));
+  const maxX = Math.max(
+    0,
+    ...glyphRecords.map((record) => record.advanceWidth),
+    ...visibleRecords.map((record) => {
+      return record.leftSideBearing + (record.designBounds.x2 - record.designBounds.x1);
+    })
+  );
+
+  return {
+    minX,
+    maxX,
+    width: maxX - minX
+  };
+}
+
 export function computeGlobalScale(
   font: Font,
   glyphRecords: GlyphSourceRecord[],
@@ -301,13 +678,13 @@ export function computeGlobalScale(
   const visibleBounds = glyphRecords
     .filter((record) => !record.empty)
     .map((record) => record.designBounds);
-  const maxWidth = Math.max(0, ...visibleBounds.map((bounds) => bounds.x2 - bounds.x1));
-  const maxHeight = Math.max(0, ...visibleBounds.map((bounds) => bounds.y2 - bounds.y1));
+  const horizontalFrame = computeHorizontalFrame(glyphRecords);
+  const frame = computeBaselineFrame(visibleBounds);
   const availableWidth = Math.max(1, settings.cellWidth - settings.padding * 2);
   const availableHeight = Math.max(1, settings.cellHeight - settings.padding * 2);
   const unitsPerEm = font.unitsPerEm || 1000;
 
-  if (maxWidth === 0 || maxHeight === 0) {
+  if (horizontalFrame.width === 0 || frame.height === 0) {
     const fontSize = Math.min(availableWidth, availableHeight);
     return {
       fontSize,
@@ -318,8 +695,8 @@ export function computeGlobalScale(
   const fontSize = Math.max(
     1,
     Math.min(
-      (availableWidth * unitsPerEm) / maxWidth,
-      (availableHeight * unitsPerEm) / maxHeight
+      (availableWidth * unitsPerEm) / horizontalFrame.width,
+      (availableHeight * unitsPerEm) / frame.height
     )
   );
 
@@ -343,10 +720,10 @@ function renderGlyphCell(
     return canvas;
   }
 
-  const snappedX1 = snapDown(record.designBounds.x1, fitPlan.sourceGridUnit);
-  const snappedY2 = snapUp(record.designBounds.y2, fitPlan.sourceGridUnit);
-  const originX = settings.padding - snappedX1 * fitPlan.scale;
-  const baselineY = settings.padding + snappedY2 * fitPlan.scale;
+  const originX =
+    cellOriginX(settings, fitPlan) +
+    (record.leftSideBearing - record.designBounds.x1) * fitPlan.scale;
+  const baselineY = cellBaselineY(settings, fitPlan);
   const path = glyph.getPath(originX, baselineY, fitPlan.fontSize);
 
   path.fill = "#000000";
@@ -358,20 +735,11 @@ function renderGlyphCell(
   return canvas;
 }
 
-function createSheetCanvas(
-  width: number,
-  height: number,
-  background: BitmapConverterSettings["background"]
-): HTMLCanvasElement {
+function createSheetCanvas(width: number, height: number): HTMLCanvasElement {
   const canvas = createCanvas(width, height);
   const context = get2dContext(canvas);
 
-  if (background === "solid") {
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, width, height);
-  } else {
-    context.clearRect(0, 0, width, height);
-  }
+  context.clearRect(0, 0, width, height);
 
   return canvas;
 }
@@ -424,26 +792,92 @@ function collectUnicodes(glyph: Glyph): number[] {
   return [...unicodes].sort((left, right) => left - right);
 }
 
+function isExportableCodepoint(unicode: number): boolean {
+  return (
+    Number.isInteger(unicode) &&
+    unicode >= 32 &&
+    unicode !== 127 &&
+    !(unicode >= 128 && unicode <= 159) &&
+    unicode <= 0x10ffff
+  );
+}
+
 function getGlyphCount(font: Font): number {
   return font.numGlyphs || font.glyphs.length || 0;
 }
 
-function getFontFamilyName(font: Font): string | undefined {
-  const names = font.names as unknown as FontNameTable;
-
-  return (
-    getNameFromTable(names, "fontFamily") ??
-    getNameFromTable(names, "preferredFamily") ??
-    getNameFromTable(names, "fullName")
-  );
-}
-
-function sheetFileName(originalFileName: string, sheetIndex: number): string {
-  return `${stripExtension(sanitizeFileStem(originalFileName))}-sheet-${sheetIndex + 1}.png`;
-}
-
 function sanitizeFileStem(fileName: string): string {
   return fileName.trim().replace(/[^a-zA-Z0-9._-]+/g, "-") || "font";
+}
+
+function normalizeAtlasFileName(fileName: string): string {
+  const sanitized = sanitizeFileStem(fileName);
+  return sanitized.toLowerCase().endsWith(".png") ? sanitized : `${stripExtension(sanitized)}.png`;
+}
+
+function normalizeCharacterOrder(characters: string): string {
+  return characters.replace(/[\r\n\t]/g, "");
+}
+
+function normalizeCharacterFilterMode(mode: unknown): CharacterFilterMode {
+  return typeof mode === "string" && isCharacterFilterMode(mode) ? mode : "none";
+}
+
+function isCharacterFilterMode(mode: string): mode is CharacterFilterMode {
+  return mode === "none" || mode === "keep-set";
+}
+
+function makeCharacterSet(characters: string): Set<string> {
+  return new Set(Array.from(characters));
+}
+
+function printableAsciiCharacters(): string {
+  let characters = "";
+
+  for (let codepoint = 32; codepoint <= 126; codepoint += 1) {
+    characters += String.fromCharCode(codepoint);
+  }
+
+  return characters;
+}
+
+function uppercaseAsciiCharacters(): string {
+  return "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+}
+
+function lowercaseAsciiCharacters(): string {
+  return "abcdefghijklmnopqrstuvwxyz";
+}
+
+function digitCharacters(): string {
+  return "0123456789";
+}
+
+function normalizeHexColor(color: string): string {
+  const value = String(color ?? "").trim();
+  const shortMatch = /^#?([0-9a-fA-F]{3})$/.exec(value);
+
+  if (shortMatch) {
+    const [red, green, blue] = Array.from(shortMatch[1]);
+    return `#${red}${red}${green}${green}${blue}${blue}`.toLowerCase();
+  }
+
+  const longMatch = /^#?([0-9a-fA-F]{6})$/.exec(value);
+
+  if (longMatch) {
+    return `#${longMatch[1]}`.toLowerCase();
+  }
+
+  throw new Error("Export text color must be a hex color like #ffffff.");
+}
+
+export function hexColorToRgba(color: string): RgbaTuple {
+  const normalized = normalizeHexColor(color);
+  const red = Number.parseInt(normalized.slice(1, 3), 16);
+  const green = Number.parseInt(normalized.slice(3, 5), 16);
+  const blue = Number.parseInt(normalized.slice(5, 7), 16);
+
+  return [red, green, blue, 255];
 }
 
 function stripExtension(fileName: string): string {
@@ -452,6 +886,15 @@ function stripExtension(fileName: string): string {
 
 function finiteOrZero(value: number): number {
   return Number.isFinite(value) ? value : 0;
+}
+
+function finiteOrFallback(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function roundMetric(value: number): number {
+  const rounded = Number(value.toFixed(6));
+  return Object.is(rounded, -0) ? 0 : rounded;
 }
 
 function clampInteger(value: number, min: number, max: number, name: string): number {
@@ -546,41 +989,4 @@ function snapUp(value: number, unit: number): number {
   }
 
   return Math.ceil(value / unit) * unit;
-}
-
-type NameEntry = Record<string, string>;
-
-interface FontNameTable {
-  [key: string]: NameEntry | FontNameTable | undefined;
-}
-
-function getNameFromTable(names: FontNameTable, key: string): string | undefined {
-  const direct = names[key];
-
-  if (isNameEntry(direct)) {
-    return getLocalizedName(direct);
-  }
-
-  for (const value of Object.values(names)) {
-    if (value && !isNameEntry(value)) {
-      const nested = getNameFromTable(value, key);
-      if (nested) {
-        return nested;
-      }
-    }
-  }
-
-  return undefined;
-}
-
-function isNameEntry(value: unknown): value is NameEntry {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    Object.values(value).every((entry) => typeof entry === "string")
-  );
-}
-
-function getLocalizedName(name: NameEntry | undefined): string | undefined {
-  return name?.en ?? Object.values(name ?? {})[0];
 }

@@ -1,4 +1,4 @@
-import type { BitmapBounds, CellPlacement, SheetBackground, SheetLayout } from "./types";
+import type { BitmapBounds, CellPlacement, RgbaTuple, SheetBackground, SheetLayout } from "./types";
 
 export interface AlphaBitmap {
   empty: boolean;
@@ -77,7 +77,8 @@ export function alphaToBinaryRgba(
   width: number,
   height: number,
   threshold: number,
-  background: SheetBackground
+  background: SheetBackground,
+  foregroundColor?: RgbaTuple
 ): BinaryRgbaResult {
   assertPositiveInteger(width, "width");
   assertPositiveInteger(height, "height");
@@ -89,6 +90,7 @@ export function alphaToBinaryRgba(
   const bitmap = alphaToBitmapRows(rgba, width, height, threshold);
   const binary = new Uint8ClampedArray(width * height * 4);
   const boundedThreshold = Math.max(0, Math.min(255, Math.round(threshold)));
+  const foreground = foregroundColor ?? defaultForegroundColor(background);
   let sourceGrayPixels = 0;
 
   for (let y = 0; y < height; y += 1) {
@@ -103,19 +105,19 @@ export function alphaToBinaryRgba(
       }
 
       if (isOn) {
-        binary[targetIndex] = 0;
-        binary[targetIndex + 1] = 0;
-        binary[targetIndex + 2] = 0;
-        binary[targetIndex + 3] = 255;
+        binary[targetIndex] = foreground[0];
+        binary[targetIndex + 1] = foreground[1];
+        binary[targetIndex + 2] = foreground[2];
+        binary[targetIndex + 3] = foreground[3];
       } else if (background === "solid") {
         binary[targetIndex] = 255;
         binary[targetIndex + 1] = 255;
         binary[targetIndex + 2] = 255;
         binary[targetIndex + 3] = 255;
       } else {
-        binary[targetIndex] = 255;
-        binary[targetIndex + 1] = 255;
-        binary[targetIndex + 2] = 255;
+        binary[targetIndex] = 0;
+        binary[targetIndex + 1] = 0;
+        binary[targetIndex + 2] = 0;
         binary[targetIndex + 3] = 0;
       }
     }
@@ -125,18 +127,20 @@ export function alphaToBinaryRgba(
     bitmap,
     rgba: binary,
     sourceGrayPixels,
-    outputInvalidPixels: countInvalidBinaryPixels(binary, background)
+    outputInvalidPixels: countInvalidBinaryPixels(binary, background, foreground)
   };
 }
 
 export function countInvalidBinaryPixels(
   rgba: ArrayLike<number>,
-  background: SheetBackground
+  background: SheetBackground,
+  foregroundColor?: RgbaTuple
 ): number {
   if (rgba.length % 4 !== 0) {
     throw new Error("RGBA data length must be divisible by 4.");
   }
 
+  const foreground = foregroundColor ?? defaultForegroundColor(background);
   let invalid = 0;
 
   for (let index = 0; index < rgba.length; index += 4) {
@@ -144,21 +148,26 @@ export function countInvalidBinaryPixels(
     const green = rgba[index + 1] ?? 0;
     const blue = rgba[index + 2] ?? 0;
     const alpha = rgba[index + 3] ?? 0;
-    const black = red === 0 && green === 0 && blue === 0 && alpha === 255;
-    const white = red === 255 && green === 255 && blue === 255 && alpha === 255;
-    const transparentWhite =
-      background === "transparent" &&
-      red === 255 &&
-      green === 255 &&
-      blue === 255 &&
-      alpha === 0;
+    const foregroundPixel =
+      red === foreground[0] &&
+      green === foreground[1] &&
+      blue === foreground[2] &&
+      alpha === foreground[3];
+    const solidEmpty =
+      background === "solid" && red === 255 && green === 255 && blue === 255 && alpha === 255;
+    const transparentEmpty =
+      background === "transparent" && red === 0 && green === 0 && blue === 0 && alpha === 0;
 
-    if (!black && !white && !transparentWhite) {
+    if (!foregroundPixel && !solidEmpty && !transparentEmpty) {
       invalid += 1;
     }
   }
 
   return invalid;
+}
+
+function defaultForegroundColor(background: SheetBackground): RgbaTuple {
+  return background === "transparent" ? [255, 255, 255, 255] : [0, 0, 0, 255];
 }
 
 export function createSheetLayouts(

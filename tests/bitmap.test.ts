@@ -58,7 +58,7 @@ describe("alphaToBinaryRgba", () => {
     expect(countInvalidBinaryPixels(result.rgba, "solid")).toBe(0);
   });
 
-  it("allows exact transparent off pixels in transparent mode", () => {
+  it("writes exact white glyphs and zero-alpha empty pixels in transparent mode", () => {
     const rgba = new Uint8ClampedArray(2 * 1 * 4);
     setAlpha(rgba, 2, 0, 0, 0);
     setAlpha(rgba, 2, 1, 0, 255);
@@ -66,10 +66,25 @@ describe("alphaToBinaryRgba", () => {
     const result = alphaToBinaryRgba(rgba, 2, 1, 128, "transparent");
 
     expect([...result.rgba]).toEqual([
-      255, 255, 255, 0,
-      0, 0, 0, 255
+      0, 0, 0, 0,
+      255, 255, 255, 255
     ]);
     expect(result.outputInvalidPixels).toBe(0);
+  });
+
+  it("writes exact selected-color glyphs in transparent mode", () => {
+    const rgba = new Uint8ClampedArray(2 * 1 * 4);
+    setAlpha(rgba, 2, 0, 0, 0);
+    setAlpha(rgba, 2, 1, 0, 255);
+
+    const result = alphaToBinaryRgba(rgba, 2, 1, 128, "transparent", [53, 198, 107, 255]);
+
+    expect([...result.rgba]).toEqual([
+      0, 0, 0, 0,
+      53, 198, 107, 255
+    ]);
+    expect(result.outputInvalidPixels).toBe(0);
+    expect(countInvalidBinaryPixels(result.rgba, "transparent", [53, 198, 107, 255])).toBe(0);
   });
 });
 
